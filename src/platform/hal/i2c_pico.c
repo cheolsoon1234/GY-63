@@ -7,10 +7,32 @@
 #include "pico/error.h"
 
 #include "hardware/gpio.h"
+#include "hardware/i2c.h"          // i2c_*(), i2c_get_hw()
 #include "hardware/structs/i2c.h"
-#include "hardware/regs/i2c.h"  // I2C_IC_TX_ABRT_SOURCE_* bits
+#include "hardware/regs/i2c.h"     // I2C_IC_TX_ABRT_SOURCE_* bits
 
 // ---------- internal helpers ----------
+
+static bool valid_addr7(uint8_t addr_7bit) {
+    // 7-bit address ranges 0x08~0x77 are typical; 0x00~0x07 reserved; 0x78~0x7F reserved
+    // 0x80 이상 차단.
+    return (addr_7bit < 0x80);
+}
+
+static i2c_pico_status_t validate_ready(i2c_pico_t *ctx) {
+    if (!ctx || !ctx->is_initialized || !ctx->instance) return I2C_PICO_ESTATE;
+    return I2C_PICO_OK;
+}
+
+static i2c_pico_status_t validate_addr(uint8_t addr_7bit) {
+    if (!valid_addr7(addr_7bit)) return I2C_PICO_EINVAL;
+    return I2C_PICO_OK;
+}
+
+static i2c_pico_status_t validate_buffer(const void *buf, size_t len) {
+    if (len > 0 && buf == NULL) return I2C_PICO_EINVAL;
+    return I2C_PICO_OK;
+}
 
 static void diag_begin(i2c_pico_t *ctx,
                        uint8_t addr_7bit,
@@ -18,11 +40,11 @@ static void diag_begin(i2c_pico_t *ctx,
                        size_t rreq,
                        bool nostop) {
     memset(&ctx->last_diag, 0, sizeof(ctx->last_diag));
-    ctx->last_diag.address_7bit      = addr_7bit;
-    ctx->last_diag.write_requested   = wreq;
-    ctx->last_diag.read_requested    = rreq;
-    ctx->last_diag.nostop            = nostop;
-    ctx->last_diag.pico_result       = 0;
+    ctx->last_diag.address_7bit          = addr_7bit;
+    ctx->last_diag.write_requested       = wreq;
+    ctx->last_diag.read_requested        = rreq;
+    ctx->last_diag.nostop                = nostop;
+    ctx->last_diag.pico_result           = 0;
     ctx->last_diag.abort_source_register = 0;
 }
 
@@ -72,30 +94,71 @@ static i2c_pico_status_t map_pico_result_to_status(i2c_pico_t *ctx, int pico_res
     return I2C_PICO_EIO;
 }
 
-static bool valid_addr7(uint8_t addr_7bit) {
-    // 7-bit address ranges 0x08~0x77 are typical; 0x00~0x07 reserved; 0x78~0x7F reserved
-    // 하지만 스캐너/특수장치 고려해서 "0x00~0x7F"는 허용하되,
-    // 사용자 실수 방지 차원에서 0x80 이상만 차단.
-    return (addr_7bit < 0x80);
+// 전송 결과를 공통 처리:
+// - pico_result 저장
+// - abort source 캡처
+// - completed 기록
+// - partial 전송이면 EIO
+// - 에러면 map
+static i2c_pico_status_t transfer_finish(i2c_pico_t *ctx,
+                                        int pico_ret,
+                                        size_t requested,
+                                        size_t *completed_out) {
+    ctx->last_diag.pico_result = pico_ret;
+
+    // For error classification (OR accumulate across legs)
+    diag_capture_abort_source(ctx);
+
+    if (pico_ret >= 0) {
+        size_t done = (size_t)pico_ret;
+        if (completed_out) *completed_out = done;
+
+        // partial이면 I/O error로 취급.
+        if (done != requested) return I2C_PICO_EIO;
+        return I2C_PICO_OK;
+    }
+
+    if (completed_out) *completed_out = 0;
+    return map_pico_result_to_status(ctx, pico_ret);
 }
 
-// ---------- public API ----------
+static i2c_pico_status_t transfer_write_leg(i2c_pico_t *ctx,
+                                            uint8_t addr_7bit,
+                                            const uint8_t *data,
+                                            size_t len,
+                                            bool nostop,
+                                            size_t *completed_out) {
+    int ret = i2c_write_timeout_us(ctx->instance, addr_7bit, data, len, nostop, ctx->timeout_us);
+    return transfer_finish(ctx, ret, len, completed_out);
+}
 
-i2c_pico_status_t i2c_pico_init(i2c_pico_t *ctx, const i2c_pico_config_t *cfg) {
-    if (!ctx || !cfg) return I2C_PICO_EINVAL;
+static i2c_pico_status_t transfer_read_leg(i2c_pico_t *ctx,
+                                           uint8_t addr_7bit,
+                                           uint8_t *data,
+                                           size_t len,
+                                           bool nostop,
+                                           size_t *completed_out) {
+    int ret = i2c_read_timeout_us(ctx->instance, addr_7bit, data, len, nostop, ctx->timeout_us);
+    return transfer_finish(ctx, ret, len, completed_out);
+}
+
+static i2c_pico_status_t init_validate_args(const i2c_pico_config_t *cfg) {
+    if (!cfg) return I2C_PICO_EINVAL;
     if (!cfg->instance) return I2C_PICO_EINVAL;
     if (cfg->baudrate_hz == 0) return I2C_PICO_EINVAL;
     if (cfg->timeout_us == 0) return I2C_PICO_EINVAL;
+    return I2C_PICO_OK;
+}
 
+static void init_configure_controller(i2c_pico_t *ctx, const i2c_pico_config_t *cfg) {
     ctx->instance = cfg->instance;
     ctx->timeout_us = cfg->timeout_us;
-    ctx->is_initialized = false;
-    memset(&ctx->last_diag, 0, sizeof(ctx->last_diag));
 
     // Init controller
     i2c_init(ctx->instance, cfg->baudrate_hz);
+}
 
-    // Configure GPIO
+static void init_configure_gpio(const i2c_pico_config_t *cfg) {
     gpio_set_function(cfg->sda_pin, GPIO_FUNC_I2C);
     gpio_set_function(cfg->scl_pin, GPIO_FUNC_I2C);
 
@@ -105,6 +168,21 @@ i2c_pico_status_t i2c_pico_init(i2c_pico_t *ctx, const i2c_pico_config_t *cfg) {
     } else {
         // Leave as-is (external pull-ups expected)
     }
+}
+
+// ---------- public API ----------
+
+i2c_pico_status_t i2c_pico_init(i2c_pico_t *ctx, const i2c_pico_config_t *cfg) {
+    if (!ctx) return I2C_PICO_EINVAL;
+
+    i2c_pico_status_t vst = init_validate_args(cfg);
+    if (vst != I2C_PICO_OK) return vst;
+
+    ctx->is_initialized = false;
+    memset(&ctx->last_diag, 0, sizeof(ctx->last_diag));
+
+    init_configure_controller(ctx, cfg);
+    init_configure_gpio(cfg);
 
     ctx->is_initialized = true;
     return I2C_PICO_OK;
@@ -126,28 +204,20 @@ i2c_pico_status_t i2c_pico_write(i2c_pico_t *ctx,
                                  const uint8_t *data,
                                  size_t len,
                                  bool nostop) {
-    if (!ctx || !ctx->is_initialized || !ctx->instance) return I2C_PICO_ESTATE;
-    if (!valid_addr7(addr_7bit)) return I2C_PICO_EINVAL;
-    if (len > 0 && data == NULL) return I2C_PICO_EINVAL;
+    i2c_pico_status_t st;
+
+    st = validate_ready(ctx);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_addr(addr_7bit);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_buffer(data, len);
+    if (st != I2C_PICO_OK) return st;
 
     diag_begin(ctx, addr_7bit, len, 0, nostop);
 
-    int ret = i2c_write_timeout_us(ctx->instance, addr_7bit, data, len, nostop, ctx->timeout_us);
-    ctx->last_diag.pico_result = ret;
-
-    // For error classification
-    diag_capture_abort_source(ctx);
-
-    if (ret >= 0) {
-        ctx->last_diag.write_completed = (size_t)ret;
-        // If partial write occurred without error code, treat as I/O error
-        if ((size_t)ret != len) return I2C_PICO_EIO;
-        return I2C_PICO_OK;
-    }
-
-    // error
-    ctx->last_diag.write_completed = 0;
-    return map_pico_result_to_status(ctx, ret);
+    return transfer_write_leg(ctx, addr_7bit, data, len, nostop, &ctx->last_diag.write_completed);
 }
 
 i2c_pico_status_t i2c_pico_read(i2c_pico_t *ctx,
@@ -155,25 +225,20 @@ i2c_pico_status_t i2c_pico_read(i2c_pico_t *ctx,
                                 uint8_t *data,
                                 size_t len,
                                 bool nostop) {
-    if (!ctx || !ctx->is_initialized || !ctx->instance) return I2C_PICO_ESTATE;
-    if (!valid_addr7(addr_7bit)) return I2C_PICO_EINVAL;
-    if (len > 0 && data == NULL) return I2C_PICO_EINVAL;
+    i2c_pico_status_t st;
+
+    st = validate_ready(ctx);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_addr(addr_7bit);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_buffer(data, len);
+    if (st != I2C_PICO_OK) return st;
 
     diag_begin(ctx, addr_7bit, 0, len, nostop);
 
-    int ret = i2c_read_timeout_us(ctx->instance, addr_7bit, data, len, nostop, ctx->timeout_us);
-    ctx->last_diag.pico_result = ret;
-
-    diag_capture_abort_source(ctx);
-
-    if (ret >= 0) {
-        ctx->last_diag.read_completed = (size_t)ret;
-        if ((size_t)ret != len) return I2C_PICO_EIO;
-        return I2C_PICO_OK;
-    }
-
-    ctx->last_diag.read_completed = 0;
-    return map_pico_result_to_status(ctx, ret);
+    return transfer_read_leg(ctx, addr_7bit, data, len, nostop, &ctx->last_diag.read_completed);
 }
 
 i2c_pico_status_t i2c_pico_write_read(i2c_pico_t *ctx,
@@ -182,59 +247,52 @@ i2c_pico_status_t i2c_pico_write_read(i2c_pico_t *ctx,
                                       size_t write_len,
                                       uint8_t *read_data,
                                       size_t read_len) {
-    if (!ctx || !ctx->is_initialized || !ctx->instance) return I2C_PICO_ESTATE;
-    if (!valid_addr7(addr_7bit)) return I2C_PICO_EINVAL;
-    if (write_len > 0 && write_data == NULL) return I2C_PICO_EINVAL;
-    if (read_len > 0 && read_data == NULL) return I2C_PICO_EINVAL;
+    i2c_pico_status_t st;
+
+    st = validate_ready(ctx);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_addr(addr_7bit);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_buffer(write_data, write_len);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_buffer(read_data, read_len);
+    if (st != I2C_PICO_OK) return st;
 
     // One combined diagnostics record
     diag_begin(ctx, addr_7bit, write_len, read_len, true);
 
-    // 1) write with repeated-start (nostop=true) if write_len>0
+    // 1) write with repeated-start (nostop=true)
     if (write_len > 0) {
-        int wret = i2c_write_timeout_us(ctx->instance, addr_7bit, write_data, write_len, true, ctx->timeout_us);
-        ctx->last_diag.pico_result = wret;
-        diag_capture_abort_source(ctx);
-
-        if (wret < 0) {
-            ctx->last_diag.write_completed = 0;
+        ctx->last_diag.nostop = true;
+        st = transfer_write_leg(ctx, addr_7bit, write_data, write_len, true, &ctx->last_diag.write_completed);
+        if (st != I2C_PICO_OK) {
+            // 실패 시 read_completed는 0 유지
             ctx->last_diag.read_completed = 0;
-            return map_pico_result_to_status(ctx, wret);
-        }
-
-        ctx->last_diag.write_completed = (size_t)wret;
-        if ((size_t)wret != write_len) {
-            // Partial write in a combined op => treat as I/O error
-            return I2C_PICO_EIO;
+            return st;
         }
     }
 
-    // 2) read with stop (nostop=false) if read_len>0
+    // 2) read with stop (nostop=false)
     if (read_len > 0) {
-        // update nostop to false for the second leg (for transparency)
         ctx->last_diag.nostop = false;
-
-        int rret = i2c_read_timeout_us(ctx->instance, addr_7bit, read_data, read_len, false, ctx->timeout_us);
-        ctx->last_diag.pico_result = rret;
-        diag_capture_abort_source(ctx);
-
-        if (rret < 0) {
-            ctx->last_diag.read_completed = 0;
-            return map_pico_result_to_status(ctx, rret);
-        }
-
-        ctx->last_diag.read_completed = (size_t)rret;
-        if ((size_t)rret != read_len) {
-            return I2C_PICO_EIO;
-        }
+        st = transfer_read_leg(ctx, addr_7bit, read_data, read_len, false, &ctx->last_diag.read_completed);
+        if (st != I2C_PICO_OK) return st;
     }
 
     return I2C_PICO_OK;
 }
 
 i2c_pico_status_t i2c_pico_probe(i2c_pico_t *ctx, uint8_t addr_7bit) {
-    if (!ctx || !ctx->is_initialized || !ctx->instance) return I2C_PICO_ESTATE;
-    if (!valid_addr7(addr_7bit)) return I2C_PICO_EINVAL;
+    i2c_pico_status_t st;
+
+    st = validate_ready(ctx);
+    if (st != I2C_PICO_OK) return st;
+
+    st = validate_addr(addr_7bit);
+    if (st != I2C_PICO_OK) return st;
 
     // Many scanners do 1-byte read; devices that NACK will fail without changing state much.
     uint8_t dummy = 0;
