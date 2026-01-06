@@ -43,8 +43,9 @@ file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS
     ${SRC_DIR}/app/*.c
     ${SRC_DIR}/core/*.c
     ${SRC_DIR}/bsp/*.c
+    ${SRC_DIR}/config/*.c
     ${SRC_DIR}/drivers/*.c
-    
+    ${SRC_DIR}/platform/*.c
     ${SRC_DIR}/platform/hal/*.c
     ${SRC_DIR}/platform/net/*.c
     # ${SRC_DIR}/core/*.cpp
@@ -70,19 +71,23 @@ target_link_libraries(GY63
 # Add the standard include files to the build
 target_include_directories(GY63 PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/include
         ${SRC_DIR}
         ${SRC_DIR}/app
         ${SRC_DIR}/core
         ${SRC_DIR}/bsp
+        ${SRC_DIR}/config
         ${SRC_DIR}/drivers
+        ${SRC_DIR}/platform
         ${SRC_DIR}/platform/hal
         ${SRC_DIR}/platform/net
 )
 
 # Add any user requested libraries
 target_link_libraries(GY63 
+        pico_stdlib
         hardware_i2c
-        # pico_cyw43_arch_lwip_threadsafe_background
+        pico_cyw43_arch_lwip_threadsafe_background
         )
 
 pico_add_extra_outputs(GY63)
