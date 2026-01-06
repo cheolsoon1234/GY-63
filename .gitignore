@@ -1,4 +1,4 @@
-build
-!.vscode/*
-outdated
+build/*
+.vscode/*
+outdated/*
 pico_sdk_import.cmake
