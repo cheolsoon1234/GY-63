@@ -7,7 +7,7 @@
 #define CFG_WIFI_PASSWORD    "hotspot1111"
 #define CFG_WIFI_TIMEOUT_MS  (30000u)
 
-#define CFG_UDP_DST_IP       "192.168.144.104"
+#define CFG_UDP_DST_IP       "192.168.144.201"
 #define CFG_UDP_DST_PORT     (5005u)
 
 #define CFG_SEND_PERIOD_MS   (200u)
